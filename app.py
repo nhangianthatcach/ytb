@@ -153,7 +153,7 @@ HTML_TEMPLATE = '''
 '''
 
 # ==========================================
-# HÀM XỬ LÝ LẤY DỮ LIỆU TỪ DB
+# CÁC HÀM XỬ LÝ DỮ LIỆU
 # ==========================================
 def get_all_records():
     if not db_pool:
@@ -170,14 +170,18 @@ def get_all_records():
         db_pool.putconn(conn)
     return records
 
-# ==========================================
-# HÀM BẮT GIÁ TRỊ TỪ APIFY (CHỐNG LỖI)
-# ==========================================
+# HÀM MỔ BỤNG DỮ LIỆU SỐ (Chống lỗi 0-0-0)
 def extract_stat(item, keys):
     for key in keys:
-        if item.get(key) is not None:
+        val = item.get(key)
+        if val is not None:
+            # Nếu Facebook giấu số liệu trong 1 cái hộp (dictionary)
+            if isinstance(val, dict):
+                val = val.get('count') or val.get('totalCount') or val.get('summary', {}).get('total_count') or val.get('total')
+                if val is None:
+                    continue
             try:
-                return int(item.get(key))
+                return int(val)
             except:
                 continue
     return 0
@@ -197,24 +201,21 @@ def index():
 
         try:
             # ==========================================
-            # 1. NHÁNH YOUTUBE (Chạy cực ổn định)
+            # 1. NHÁNH YOUTUBE 
             # ==========================================
             if "youtube.com" in url or "youtu.be" in url:
                 platform = "youtube"
-                
                 if "/shorts/" in url:
                     video_type = "Shorts"
                     match = re.search(r"/shorts/([a-zA-Z0-9_-]+)", url)
                 else:
                     match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
-                
                 if match: 
                     video_id = match.group(1)
 
                 if video_id:
                     api_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id={video_id}&key={API_KEY}"
                     response = requests.get(api_url).json()
-                    
                     if response.get('items'):
                         item = response['items'][0]
                         title = item['snippet']['title']
@@ -229,25 +230,21 @@ def index():
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
             # ==========================================
-            # 2. NHÁNH FACEBOOK (BẢN FINAL CHỐNG TRƯỢT)
+            # 2. NHÁNH FACEBOOK (BẢN FINAL CHỐNG LỖI DICT)
             # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
                 safe_url = url
-                
                 if "fb.watch" in safe_url:
                     raise Exception("Hệ thống không hỗ trợ link fb.watch. Hãy mở trình duyệt và copy link facebook.com gốc.")
                 
-                # Ép chuẩn domain Facebook
                 safe_url = re.sub(r'^(https?://)?([a-zA-Z0-9_.-]+\.)?facebook\.com', 'https://www.facebook.com', safe_url)
 
                 client = ApifyClient(APIFY_TOKEN)
-                
-                # Gọi Bot chuyên dụng apify/facebook-posts-scraper
                 run_input = {
                     "startUrls": [{"url": safe_url}],
                     "resultsLimit": 1,
-                    "proxyConfiguration": {"useApifyProxy": True} # Bật proxy để lách chặn
+                    "proxyConfiguration": {"useApifyProxy": True}
                 }
                 
                 run = client.actor("apify/facebook-posts-scraper").call(run_input=run_input)
@@ -257,20 +254,29 @@ def index():
                 if items:
                     item = items[0]
                     
-                    # 1. Bóc ID khôn ngoan
+                    # 1. Bóc ID 
                     url_parts = [p for p in url.split('/') if p]
                     fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
-                    raw_id = str(item.get('postId') or item.get('id') or item.get('post_id') or fallback_id)
-                    video_id = raw_id[:250]
+                    raw_id = item.get('postId') or item.get('id') or item.get('post_id') or fallback_id
                     
-                    # 2. Bóc Tiêu đề (Quét mọi từ khóa có thể)
+                    # Nếu ID bị chui vào dict thì bóc ra
+                    if isinstance(raw_id, dict):
+                        raw_id = raw_id.get('id') or str(raw_id)
+                    video_id = str(raw_id)[:250]
+                    
+                    # 2. Bóc Tiêu Đề (ÉP KIỂU STRING ĐỂ CHỐNG DB CRASH)
                     title_raw = item.get('text') or item.get('message') or item.get('description') or item.get('title') or item.get('content') or ''
-                    # Nếu post không có text, lấy tên page/author bù vào
+                    if isinstance(title_raw, dict):
+                        title_raw = title_raw.get('text') or title_raw.get('message') or ''
+                        
+                    title_raw = str(title_raw).strip()
+                    
                     if not title_raw:
-                        author_name = item.get('user', {}).get('name') or item.get('author', {}).get('name') or ''
+                        author = item.get('user') or item.get('author')
+                        author_name = author.get('name') if isinstance(author, dict) else ''
                         title_raw = f"Bài viết của {author_name}" if author_name else ""
                         
-                    title = title_raw[:65] + "..." if title_raw and len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
+                    title = title_raw[:65] + "..." if len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
                     # 3. Gắn nhãn
                     if "reel" in url:
@@ -287,18 +293,18 @@ def index():
                     likes = extract_stat(item, ['likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes'])
                     comments = extract_stat(item, ['comments', 'commentsCount', 'postComments'])
                     
-                    # LỌC RÁC: Tránh lưu những kết quả rỗng do bot đụng tường đăng nhập FB
+                    # Cửa tử lọc rác
                     if views == 0 and likes == 0 and comments == 0 and not title_raw:
-                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Facebook đang chặn bot đọc dữ liệu link này! Thử lại với link khác hoặc nạp cookie cho Apify.</div>'
+                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Facebook đang chặn quyền lấy dữ liệu! Thử lại với link khác.</div>'
                     else:
                         success = True
                 else:
-                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn, bị giới hạn khu vực, hoặc không công khai!</div>'
+                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn hoặc không công khai!</div>'
             else:
                 message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Chỉ hỗ trợ Link YouTube và Facebook!</div>'
 
             # ==========================================
-            # 3. LƯU VÀO DATABASE NẾU THÀNH CÔNG
+            # 3. LƯU VÀO DATABASE
             # ==========================================
             if success and video_id and db_pool:
                 conn = db_pool.getconn()
