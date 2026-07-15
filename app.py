@@ -238,7 +238,7 @@ def index():
                 
                 # Gọi Bot Apify
                 run = client.actor("zanTWNqB3Poz44qdY").call(run_input=run_input)
-                items = client.dataset(run["defaultDatasetId"]).list_items().items
+                items = client.dataset(run.default_dataset_id).list_items().items
                 
                 if items:
                     item = items[0]
