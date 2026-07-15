@@ -8,12 +8,14 @@ from apify_client import ApifyClient
 
 app = Flask(__name__)
 
-# LẤY BIẾN MÔI TRƯỜNG TỪ RENDER
+# ==========================================
+# CẤU HÌNH BIẾN MÔI TRƯỜNG & DATABASE
+# ==========================================
 API_KEY = os.getenv("YOUTUBE_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN") 
 
-# HỒ CHỨA KẾT NỐI DATABASE
+db_pool = None
 try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
     conn = db_pool.getconn()
@@ -34,7 +36,9 @@ try:
 except Exception as e:
     print("Lỗi khởi tạo Database Pool:", e)
 
-# GIAO DIỆN HTML
+# ==========================================
+# GIAO DIỆN HTML (UI/UX)
+# ==========================================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="vi">
@@ -67,7 +71,6 @@ HTML_TEMPLATE = '''
 </head>
 <body>
     <div class="container main-container">
-        <!-- Khu vực nhập liệu -->
         <div class="card app-card mb-4">
             <h2 class="header-title"><i class="fa-solid fa-bolt text-warning me-2"></i>Social Media Data Pro</h2>
             <p class="header-subtitle">Hệ thống quét dữ liệu đa nền tảng tự động</p>
@@ -84,7 +87,7 @@ HTML_TEMPLATE = '''
                     <i class="fa-solid fa-cloud-arrow-down me-2"></i>Tiến Hành Thu Thập Dữ Liệu
                 </button>
                 <div id="waitMsg" class="text-center mt-3 text-primary fw-medium" style="display:none; font-size: 0.9rem;">
-                    <i class="fa-solid fa-circle-notch fa-spin me-2"></i>Hệ thống đang quét... (Link Facebook cần khởi tạo Bot nên sẽ mất 1-2 phút)
+                    <i class="fa-solid fa-circle-notch fa-spin me-2"></i>Hệ thống đang quét... (Quá trình cào Facebook có thể mất 15-30 giây)
                 </div>
             </form>
             
@@ -93,7 +96,6 @@ HTML_TEMPLATE = '''
             {% endif %}
         </div>
 
-        <!-- Khu vực hiển thị Database -->
         <div class="card app-card">
             <h4 class="mb-4 fw-bold text-dark"><i class="fa-solid fa-server me-2 text-primary"></i>Kho Dữ Liệu Đã Lưu</h4>
             
@@ -150,7 +152,12 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
+# ==========================================
+# HÀM XỬ LÝ LẤY DỮ LIỆU TỪ DB
+# ==========================================
 def get_all_records():
+    if not db_pool:
+        return []
     conn = db_pool.getconn()
     records = []
     try:
@@ -162,6 +169,18 @@ def get_all_records():
     finally:
         db_pool.putconn(conn)
     return records
+
+# ==========================================
+# HÀM BẮT GIÁ TRỊ TỪ APIFY (CHỐNG LỖI)
+# ==========================================
+def extract_stat(item, keys):
+    for key in keys:
+        if item.get(key) is not None:
+            try:
+                return int(item.get(key))
+            except:
+                continue
+    return 0
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -178,7 +197,7 @@ def index():
 
         try:
             # ==========================================
-            # 1. NHÁNH XỬ LÝ YOUTUBE
+            # 1. NHÁNH YOUTUBE (Chạy cực ổn định)
             # ==========================================
             if "youtube.com" in url or "youtu.be" in url:
                 platform = "youtube"
@@ -210,30 +229,27 @@ def index():
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
             # ==========================================
-            # 2. NHÁNH XỬ LÝ FACEBOOK (DÙNG BOT CHÍNH HÃNG APIFY)
+            # 2. NHÁNH FACEBOOK (BẢN FINAL CHỐNG TRƯỢT)
             # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
                 safe_url = url
                 
                 if "fb.watch" in safe_url:
-                    raise Exception("Bot không hỗ trợ link fb.watch rút gọn. Hãy mở trình duyệt và lấy link facebook.com gốc.")
+                    raise Exception("Hệ thống không hỗ trợ link fb.watch. Hãy mở trình duyệt và copy link facebook.com gốc.")
                 
+                # Ép chuẩn domain Facebook
                 safe_url = re.sub(r'^(https?://)?([a-zA-Z0-9_.-]+\.)?facebook\.com', 'https://www.facebook.com', safe_url)
-                
-                if "/reel/" in safe_url:
-                    safe_url = re.sub(r'/reel/([0-9a-zA-Z_]+)/?', r'/watch/?v=\1', safe_url)
 
                 client = ApifyClient(APIFY_TOKEN)
                 
-                # SỬ DỤNG BOT CHÍNH HÃNG CỦA APIFY (apify/facebook-posts-scraper)
-                # Input cũng đổi từ "pageUrls" thành "startUrls" theo chuẩn của bot này
+                # Gọi Bot chuyên dụng apify/facebook-posts-scraper
                 run_input = {
                     "startUrls": [{"url": safe_url}],
-                    "resultsLimit": 1
+                    "resultsLimit": 1,
+                    "proxyConfiguration": {"useApifyProxy": True} # Bật proxy để lách chặn
                 }
                 
-                # Gọi Bot Mới
                 run = client.actor("apify/facebook-posts-scraper").call(run_input=run_input)
                 dataset = client.dataset(run.default_dataset_id)
                 items = dataset.list_items().items
@@ -241,42 +257,50 @@ def index():
                 if items:
                     item = items[0]
                     
-                    # Quét tìm ID
+                    # 1. Bóc ID khôn ngoan
                     url_parts = [p for p in url.split('/') if p]
                     fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
-                    raw_id = str(item.get('postId') or item.get('id') or fallback_id)
+                    raw_id = str(item.get('postId') or item.get('id') or item.get('post_id') or fallback_id)
                     video_id = raw_id[:250]
                     
-                    # Quét tìm Tiêu đề
-                    title_raw = item.get('text') or item.get('description') or item.get('content') or item.get('title') or ''
+                    # 2. Bóc Tiêu đề (Quét mọi từ khóa có thể)
+                    title_raw = item.get('text') or item.get('message') or item.get('description') or item.get('title') or item.get('content') or ''
+                    # Nếu post không có text, lấy tên page/author bù vào
+                    if not title_raw:
+                        author_name = item.get('user', {}).get('name') or item.get('author', {}).get('name') or ''
+                        title_raw = f"Bài viết của {author_name}" if author_name else ""
+                        
                     title = title_raw[:65] + "..." if title_raw and len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
-                    # Phân loại
+                    # 3. Gắn nhãn
                     if "reel" in url:
                         video_type = "Reels"
                     elif "posts" in url or "pfbid" in url:
                         video_type = "Bài Viết FB"
                     elif item.get('is_video') or "watch" in url or "video" in url:
                         video_type = "Video FB"
-                    elif "photo" in url:
-                        video_type = "Ảnh FB"
                     else:
                         video_type = "Post FB"
                     
-                    # Quét tìm Chỉ số tương tác 
-                    views = int(item.get('viewsCount') or item.get('views') or item.get('playCount') or 0)
-                    likes = int(item.get('likesCount') or item.get('likes') or item.get('reactionCount') or 0)
-                    comments = int(item.get('commentsCount') or item.get('comments') or 0)
-                    success = True
+                    # 4. Bóc Số Liệu Bằng Hàm Vét Cạn
+                    views = extract_stat(item, ['videoViewCount', 'viewsCount', 'views', 'playCount'])
+                    likes = extract_stat(item, ['likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes'])
+                    comments = extract_stat(item, ['comments', 'commentsCount', 'postComments'])
+                    
+                    # LỌC RÁC: Tránh lưu những kết quả rỗng do bot đụng tường đăng nhập FB
+                    if views == 0 and likes == 0 and comments == 0 and not title_raw:
+                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Facebook đang chặn bot đọc dữ liệu link này! Thử lại với link khác hoặc nạp cookie cho Apify.</div>'
+                    else:
+                        success = True
                 else:
-                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot bị chặn hoặc bài viết này không được công khai!</div>'
+                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn, bị giới hạn khu vực, hoặc không công khai!</div>'
             else:
                 message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Chỉ hỗ trợ Link YouTube và Facebook!</div>'
 
             # ==========================================
-            # 3. LƯU VÀO DATABASE
+            # 3. LƯU VÀO DATABASE NẾU THÀNH CÔNG
             # ==========================================
-            if success and video_id:
+            if success and video_id and db_pool:
                 conn = db_pool.getconn()
                 try:
                     cursor = conn.cursor()
