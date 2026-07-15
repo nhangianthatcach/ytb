@@ -18,7 +18,6 @@ try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
     conn = db_pool.getconn()
     cursor = conn.cursor()
-    # TẠO BẢNG (Đã mở rộng độ dài video_id để chứa các mã pfbid siêu dài của Facebook)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS video_stats (
             video_id VARCHAR(500) PRIMARY KEY,
@@ -151,7 +150,6 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# HÀM ĐỌC DỮ LIỆU TỪ DB
 def get_all_records():
     conn = db_pool.getconn()
     records = []
@@ -202,7 +200,6 @@ def index():
                         item = response['items'][0]
                         title = item['snippet']['title']
                         stats = item['statistics']
-                        
                         views = int(stats.get('viewCount', 0))
                         likes = int(stats.get('likeCount', 0))
                         comments = int(stats.get('commentCount', 0))
@@ -213,20 +210,32 @@ def index():
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
             # ==========================================
-            # 2. NHÁNH XỬ LÝ FACEBOOK (XỬ LÝ REEL, POST, PFBID)
+            # 2. NHÁNH XỬ LÝ FACEBOOK (CÓ BỘ LỌC ÉP URL CHUẨN)
             # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
-                client = ApifyClient(APIFY_TOKEN)
+                safe_url = url
                 
-                # CẬP NHẬT CỐT LÕI: pageUrls MANG ĐÚNG ĐỊNH DẠNG LIST OF STRINGS
+                # BƯỚC 1: Chặn link fb.watch (vì bot không tự chuyển hướng được)
+                if "fb.watch" in safe_url:
+                    raise Exception("Bot không hỗ trợ link fb.watch rút gọn. Hãy mở trình duyệt và lấy link facebook.com gốc.")
+                
+                # BƯỚC 2: Ép chuẩn tên miền (Đổi m.facebook, l.facebook, v.v... thành www.facebook.com)
+                # Và thêm https:// nếu người dùng quên nhập
+                safe_url = re.sub(r'^(https?://)?([a-zA-Z0-9_.-]+\.)?facebook\.com', 'https://www.facebook.com', safe_url)
+                
+                # BƯỚC 3: Lừa bot Apify (Đổi link /reel/ thành /watch/?v= để qua mặt bộ lọc "kén ăn")
+                if "/reel/" in safe_url:
+                    safe_url = re.sub(r'/reel/([0-9]+)/?', r'/watch/?v=\1', safe_url)
+
+                # Chạy Bot
+                client = ApifyClient(APIFY_TOKEN)
                 run_input = {
-                    "pageUrls": [url],
+                    "pageUrls": [safe_url],
                     "proxyConfiguration": {"useApifyProxy": True},
                     "resultsLimit": 1
                 }
                 
-                # Gọi Bot Apify
                 run = client.actor("zanTWNqB3Poz44qdY").call(run_input=run_input)
                 dataset = client.dataset(run.default_dataset_id)
                 items = dataset.list_items().items
@@ -234,21 +243,14 @@ def index():
                 if items:
                     item = items[0]
                     
-                    # RÚT TRÍCH ID THÔNG MINH (Xử lý các đuôi / pfbid phức tạp)
-                    # Loại bỏ dấu '/' ở cuối link để cắt ID chuẩn xác hơn
                     url_parts = [p for p in url.split('/') if p]
                     fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
-                    
-                    # Lấy ID từ Apify trả về, nếu không có thì lấy phần đuôi của URL
                     raw_id = str(item.get('postId') or item.get('id') or fallback_id)
-                    # Cắt ngắn ID nếu nó dài quá 250 ký tự (phòng hờ pfbid siêu dài)
                     video_id = raw_id[:250]
                     
-                    # Lấy Tiêu Đề
                     title_raw = item.get('text') or item.get('description') or item.get('content') or item.get('title') or ''
                     title = title_raw[:65] + "..." if title_raw and len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
-                    # Phân loại rạch ròi
                     if "reel" in url:
                         video_type = "Reels"
                     elif "posts" in url or "pfbid" in url:
@@ -260,15 +262,12 @@ def index():
                     else:
                         video_type = "Post FB"
                     
-                    # Trích xuất chỉ số (Quét cạn)
                     views = int(item.get('viewsCount') or item.get('views') or item.get('playCount') or 0)
                     likes = int(item.get('likesCount') or item.get('likes') or item.get('reactionCount') or 0)
                     comments = int(item.get('commentsCount') or item.get('comments') or 0)
-                    
                     success = True
                 else:
                     message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot bị chặn hoặc bài viết này không được công khai!</div>'
-
             else:
                 message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Chỉ hỗ trợ Link YouTube và Facebook!</div>'
 
@@ -300,7 +299,6 @@ def index():
         except Exception as e:
             message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Lỗi gọi API: {str(e)}</div>'
 
-    # Hiển thị lại danh sách
     saved_records = get_all_records()
     return render_template_string(HTML_TEMPLATE, message=message, records=saved_records)
 
