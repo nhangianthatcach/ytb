@@ -18,10 +18,10 @@ try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
     conn = db_pool.getconn()
     cursor = conn.cursor()
-    # TẠO BẢNG NẾU CHƯA CÓ (Bao gồm cột platform để phân biệt FB/YT)
+    # TẠO BẢNG (Đã mở rộng độ dài video_id để chứa các mã pfbid siêu dài của Facebook)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS video_stats (
-            video_id TEXT PRIMARY KEY,
+            video_id VARCHAR(500) PRIMARY KEY,
             platform TEXT,
             title TEXT,
             video_type TEXT,
@@ -35,7 +35,7 @@ try:
 except Exception as e:
     print("Lỗi khởi tạo Database Pool:", e)
 
-# GIAO DIỆN HTML HIỆN ĐẠI
+# GIAO DIỆN HTML
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="vi">
@@ -185,7 +185,6 @@ def index():
             if "youtube.com" in url or "youtu.be" in url:
                 platform = "youtube"
                 
-                # Bóc tách ID cho cả Shorts lẫn Video thường
                 if "/shorts/" in url:
                     video_type = "Shorts"
                     match = re.search(r"/shorts/([a-zA-Z0-9_-]+)", url)
@@ -209,20 +208,20 @@ def index():
                         comments = int(stats.get('commentCount', 0))
                         success = True
                     else:
-                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-circle-xmark me-2"></i>Không tìm thấy video YouTube! Link có thể bị lỗi hoặc video đã xóa.</div>'
+                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-circle-xmark me-2"></i>Không tìm thấy video YouTube!</div>'
                 else:
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
             # ==========================================
-            # 2. NHÁNH XỬ LÝ FACEBOOK (ĐÃ FIX LỖI PAGEURLS)
+            # 2. NHÁNH XỬ LÝ FACEBOOK (XỬ LÝ REEL, POST, PFBID)
             # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
                 client = ApifyClient(APIFY_TOKEN)
                 
-                # Đã đổi "startUrls" thành "pageUrls" theo đúng yêu cầu của Bot
+                # CẬP NHẬT CỐT LÕI: pageUrls MANG ĐÚNG ĐỊNH DẠNG LIST OF STRINGS
                 run_input = {
-                    "pageUrls": [{"url": url}],
+                    "pageUrls": [url],
                     "proxyConfiguration": {"useApifyProxy": True},
                     "resultsLimit": 1
                 }
@@ -235,38 +234,46 @@ def index():
                 if items:
                     item = items[0]
                     
-                    # Tự động quét và lấy ID tốt nhất có thể
-                    video_id = str(item.get('postId') or item.get('id') or item.get('url', url).split('/')[-1] or 'fb_' + str(abs(hash(url))))
+                    # RÚT TRÍCH ID THÔNG MINH (Xử lý các đuôi / pfbid phức tạp)
+                    # Loại bỏ dấu '/' ở cuối link để cắt ID chuẩn xác hơn
+                    url_parts = [p for p in url.split('/') if p]
+                    fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
                     
-                    # Quét toàn bộ các trường chứa text để làm Tiêu đề
+                    # Lấy ID từ Apify trả về, nếu không có thì lấy phần đuôi của URL
+                    raw_id = str(item.get('postId') or item.get('id') or fallback_id)
+                    # Cắt ngắn ID nếu nó dài quá 250 ký tự (phòng hờ pfbid siêu dài)
+                    video_id = raw_id[:250]
+                    
+                    # Lấy Tiêu Đề
                     title_raw = item.get('text') or item.get('description') or item.get('content') or item.get('title') or ''
                     title = title_raw[:65] + "..." if title_raw and len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
-                    # Tự động phân loại nội dung thông minh
+                    # Phân loại rạch ròi
                     if "reel" in url:
                         video_type = "Reels"
+                    elif "posts" in url or "pfbid" in url:
+                        video_type = "Bài Viết FB"
                     elif item.get('is_video') or "watch" in url or "video" in url:
                         video_type = "Video FB"
                     elif "photo" in url:
                         video_type = "Ảnh FB"
                     else:
-                        video_type = "Bài Viết FB"
+                        video_type = "Post FB"
                     
-                    # Quét mọi biến có thể chứa số liệu thống kê
+                    # Trích xuất chỉ số (Quét cạn)
                     views = int(item.get('viewsCount') or item.get('views') or item.get('playCount') or 0)
                     likes = int(item.get('likesCount') or item.get('likes') or item.get('reactionCount') or 0)
                     comments = int(item.get('commentsCount') or item.get('comments') or 0)
                     
                     success = True
                 else:
-                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot bị chặn hoặc không tìm thấy dữ liệu! Thử lại với bài viết CÔNG KHAI (Public).</div>'
+                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot bị chặn hoặc bài viết này không được công khai!</div>'
 
-            # Nếu không phải 2 nền tảng trên
             else:
-                message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Hệ thống hiện tại chỉ hỗ trợ Link YouTube và Facebook!</div>'
+                message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Chỉ hỗ trợ Link YouTube và Facebook!</div>'
 
             # ==========================================
-            # 3. LƯU VÀO DATABASE (UPSERT - Cập nhật nếu đã có)
+            # 3. LƯU VÀO DATABASE
             # ==========================================
             if success and video_id:
                 conn = db_pool.getconn()
@@ -286,14 +293,14 @@ def index():
                     conn.commit()
                     message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b></div>'
                 except Exception as db_err:
-                    message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-database me-2"></i>Lỗi ghi vào Database: {str(db_err)}</div>'
+                    message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-database me-2"></i>Lỗi ghi DB: {str(db_err)}</div>'
                 finally:
                     db_pool.putconn(conn)
 
         except Exception as e:
-            message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Lỗi hệ thống: {str(e)}</div>'
+            message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Lỗi gọi API: {str(e)}</div>'
 
-    # LOAD LẠI DỮ LIỆU ĐỂ HIỂN THỊ
+    # Hiển thị lại danh sách
     saved_records = get_all_records()
     return render_template_string(HTML_TEMPLATE, message=message, records=saved_records)
 
