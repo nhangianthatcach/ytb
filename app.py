@@ -214,15 +214,15 @@ def index():
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
             # ==========================================
-            # 2. NHÁNH XỬ LÝ FACEBOOK (BẮT LƯỚI TOÀN DIỆN)
+            # 2. NHÁNH XỬ LÝ FACEBOOK (ĐÃ FIX LỖI PAGEURLS)
             # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
                 client = ApifyClient(APIFY_TOKEN)
                 
-                # Cấu hình "ép" bot khởi động trình duyệt và dùng Proxy
+                # Đã đổi "startUrls" thành "pageUrls" theo đúng yêu cầu của Bot
                 run_input = {
-                    "startUrls": [{"url": url}],
+                    "pageUrls": [{"url": url}],
                     "proxyConfiguration": {"useApifyProxy": True},
                     "resultsLimit": 1
                 }
@@ -240,7 +240,6 @@ def index():
                     
                     # Quét toàn bộ các trường chứa text để làm Tiêu đề
                     title_raw = item.get('text') or item.get('description') or item.get('content') or item.get('title') or ''
-                    # Rút gọn title để không phá giao diện
                     title = title_raw[:65] + "..." if title_raw and len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
                     # Tự động phân loại nội dung thông minh
