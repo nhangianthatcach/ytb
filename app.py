@@ -210,47 +210,48 @@ def index():
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
             # ==========================================
-            # 2. NHÁNH XỬ LÝ FACEBOOK (CÓ BỘ LỌC ÉP URL CHUẨN)
+            # 2. NHÁNH XỬ LÝ FACEBOOK (DÙNG BOT CHÍNH HÃNG APIFY)
             # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
                 safe_url = url
                 
-                # BƯỚC 1: Chặn link fb.watch (vì bot không tự chuyển hướng được)
                 if "fb.watch" in safe_url:
                     raise Exception("Bot không hỗ trợ link fb.watch rút gọn. Hãy mở trình duyệt và lấy link facebook.com gốc.")
                 
-                # BƯỚC 2: Ép chuẩn tên miền (Đổi m.facebook, l.facebook, v.v... thành www.facebook.com)
-                # Và thêm https:// nếu người dùng quên nhập
                 safe_url = re.sub(r'^(https?://)?([a-zA-Z0-9_.-]+\.)?facebook\.com', 'https://www.facebook.com', safe_url)
                 
-                # BƯỚC 3: Lừa bot Apify (Đổi link /reel/ thành /watch/?v= để qua mặt bộ lọc "kén ăn")
                 if "/reel/" in safe_url:
-                    safe_url = re.sub(r'/reel/([0-9]+)/?', r'/watch/?v=\1', safe_url)
+                    safe_url = re.sub(r'/reel/([0-9a-zA-Z_]+)/?', r'/watch/?v=\1', safe_url)
 
-                # Chạy Bot
                 client = ApifyClient(APIFY_TOKEN)
+                
+                # SỬ DỤNG BOT CHÍNH HÃNG CỦA APIFY (apify/facebook-posts-scraper)
+                # Input cũng đổi từ "pageUrls" thành "startUrls" theo chuẩn của bot này
                 run_input = {
-                    "pageUrls": [safe_url],
-                    "proxyConfiguration": {"useApifyProxy": True},
+                    "startUrls": [{"url": safe_url}],
                     "resultsLimit": 1
                 }
                 
-                run = client.actor("zanTWNqB3Poz44qdY").call(run_input=run_input)
+                # Gọi Bot Mới
+                run = client.actor("apify/facebook-posts-scraper").call(run_input=run_input)
                 dataset = client.dataset(run.default_dataset_id)
                 items = dataset.list_items().items
                 
                 if items:
                     item = items[0]
                     
+                    # Quét tìm ID
                     url_parts = [p for p in url.split('/') if p]
                     fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
                     raw_id = str(item.get('postId') or item.get('id') or fallback_id)
                     video_id = raw_id[:250]
                     
+                    # Quét tìm Tiêu đề
                     title_raw = item.get('text') or item.get('description') or item.get('content') or item.get('title') or ''
                     title = title_raw[:65] + "..." if title_raw and len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
+                    # Phân loại
                     if "reel" in url:
                         video_type = "Reels"
                     elif "posts" in url or "pfbid" in url:
@@ -262,6 +263,7 @@ def index():
                     else:
                         video_type = "Post FB"
                     
+                    # Quét tìm Chỉ số tương tác 
                     views = int(item.get('viewsCount') or item.get('views') or item.get('playCount') or 0)
                     likes = int(item.get('likesCount') or item.get('likes') or item.get('reactionCount') or 0)
                     comments = int(item.get('commentsCount') or item.get('comments') or 0)
