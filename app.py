@@ -1,10 +1,15 @@
 from flask import Flask, request, render_template_string
-import requests
-import re
-import psycopg2
-from psycopg2 import pool
+import hashlib
+import json
 import os
+import re
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+
+import psycopg2
+import requests
 from apify_client import ApifyClient
+from markupsafe import escape
+from psycopg2 import pool
 
 app = Flask(__name__)
 
@@ -13,28 +18,56 @@ app = Flask(__name__)
 # ==========================================
 API_KEY = os.getenv("YOUTUBE_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-APIFY_TOKEN = os.getenv("APIFY_TOKEN") 
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
-db_pool = None
+
+def init_database():
+    """Tạo bảng và tự động bổ sung cột mới cho database cũ."""
+    if not DATABASE_URL:
+        app.logger.warning("DATABASE_URL chưa được cấu hình.")
+        return None
+
+    connection_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
+    conn = connection_pool.getconn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS video_stats (
+                    video_id VARCHAR(500) PRIMARY KEY,
+                    platform TEXT,
+                    title TEXT,
+                    video_type TEXT,
+                    view_count BIGINT DEFAULT 0,
+                    like_count BIGINT DEFAULT 0,
+                    comment_count BIGINT DEFAULT 0,
+                    share_count BIGINT DEFAULT 0
+                )
+                """
+            )
+            # CREATE TABLE IF NOT EXISTS không bổ sung cột cho bảng đã tồn tại.
+            cursor.execute(
+                """
+                ALTER TABLE video_stats
+                ADD COLUMN IF NOT EXISTS share_count BIGINT DEFAULT 0
+                """
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        connection_pool.putconn(conn)
+
+    return connection_pool
+
+
 try:
-    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
-    conn = db_pool.getconn()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS video_stats (
-            video_id VARCHAR(500) PRIMARY KEY,
-            platform TEXT,
-            title TEXT,
-            video_type TEXT,
-            view_count BIGINT,
-            like_count BIGINT,
-            comment_count BIGINT
-        )
-    ''')
-    conn.commit()
-    db_pool.putconn(conn)
-except Exception as e:
-    print("Lỗi khởi tạo Database Pool:", e)
+    db_pool = init_database()
+except Exception as exc:
+    db_pool = None
+    app.logger.exception("Lỗi khởi tạo Database Pool: %s", exc)
+
 
 # ==========================================
 # GIAO DIỆN HTML (UI/UX)
@@ -50,7 +83,7 @@ HTML_TEMPLATE = '''
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
         body { background-color: #f4f7f6; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #2c3e50; }
-        .main-container { max-width: 950px; margin-top: 3rem; margin-bottom: 5rem;}
+        .main-container { max-width: 1100px; margin-top: 3rem; margin-bottom: 5rem; }
         .app-card { background: #ffffff; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.08); padding: 2.5rem; border: none; }
         .header-title { color: #1e3c72; font-weight: 800; margin-bottom: 0.5rem; text-align: center; font-size: 2rem; }
         .header-subtitle { text-align: center; color: #64748b; margin-bottom: 2.5rem; font-size: 0.95rem; }
@@ -63,10 +96,10 @@ HTML_TEMPLATE = '''
         .fa-facebook { color: #0866FF; }
         .table-custom { font-size: 0.95rem; }
         .table-custom thead { background-color: #f8fafc; }
-        .table-custom th { color: #475569; font-size: 0.85rem; text-transform: uppercase; padding: 1rem; border-bottom: 2px solid #e2e8f0; font-weight: 700; }
+        .table-custom th { color: #475569; font-size: 0.85rem; text-transform: uppercase; padding: 1rem; border-bottom: 2px solid #e2e8f0; font-weight: 700; white-space: nowrap; }
         .table-custom td { padding: 1rem; vertical-align: middle; border-bottom: 1px solid #f1f5f9; }
         .badge-type { font-size: 0.75rem; padding: 0.4em 0.7em; border-radius: 6px; background: #e2e8f0; color: #475569; font-weight: 600; }
-        .video-title { font-weight: 600; color: #1e293b; max-width: 320px; display: inline-block; }
+        .video-title { font-weight: 600; color: #1e293b; max-width: 350px; display: inline-block; }
     </style>
 </head>
 <body>
@@ -74,7 +107,7 @@ HTML_TEMPLATE = '''
         <div class="card app-card mb-4">
             <h2 class="header-title"><i class="fa-solid fa-bolt text-warning me-2"></i>Social Media Data Pro</h2>
             <p class="header-subtitle">Hệ thống quét dữ liệu đa nền tảng tự động</p>
-            
+
             <form method="POST" id="fetchForm">
                 <div class="mb-4">
                     <label class="form-label fw-bold text-muted small text-uppercase">Nguồn Dữ Liệu (YouTube / Facebook)</label>
@@ -87,10 +120,10 @@ HTML_TEMPLATE = '''
                     <i class="fa-solid fa-cloud-arrow-down me-2"></i>Tiến Hành Thu Thập Dữ Liệu
                 </button>
                 <div id="waitMsg" class="text-center mt-3 text-primary fw-medium" style="display:none; font-size: 0.9rem;">
-                    <i class="fa-solid fa-circle-notch fa-spin me-2"></i>Hệ thống đang quét... (Facebook Reels cần 15-30 giây để khoan lõi)
+                    <i class="fa-solid fa-circle-notch fa-spin me-2"></i>Hệ thống đang quét... (Quá trình cào Facebook có thể mất 15-30 giây)
                 </div>
             </form>
-            
+
             {% if message %}
                 <div class="mt-4">{{ message | safe }}</div>
             {% endif %}
@@ -98,16 +131,17 @@ HTML_TEMPLATE = '''
 
         <div class="card app-card">
             <h4 class="mb-4 fw-bold text-dark"><i class="fa-solid fa-server me-2 text-primary"></i>Kho Dữ Liệu Đã Lưu</h4>
-            
+
             {% if records %}
             <div class="table-responsive">
                 <table class="table table-custom table-hover align-middle mb-0">
                     <thead>
                         <tr>
-                            <th width="45%">Nội dung đã quét</th>
+                            <th width="42%">Nội dung đã quét</th>
                             <th class="text-end">Lượt xem</th>
                             <th class="text-end">Lượt thích</th>
                             <th class="text-end">Bình luận</th>
+                            <th class="text-end">Chia sẻ</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -120,9 +154,10 @@ HTML_TEMPLATE = '''
                                 </div>
                                 <span class="badge-type"><i class="fa-solid fa-tag me-1"></i>{{ row[3] }}</span>
                             </td>
-                            <td class="text-end fw-bold text-dark">{{ "{:,.0f}".format(row[4]) }}</td>
-                            <td class="text-end text-muted fw-medium">{{ "{:,.0f}".format(row[5]) }}</td>
-                            <td class="text-end text-muted fw-medium">{{ "{:,.0f}".format(row[6]) }}</td>
+                            <td class="text-end fw-bold text-dark">{{ "{:,.0f}".format(row[4] or 0) }}</td>
+                            <td class="text-end text-muted fw-medium">{{ "{:,.0f}".format(row[5] or 0) }}</td>
+                            <td class="text-end text-muted fw-medium">{{ "{:,.0f}".format(row[6] or 0) }}</td>
+                            <td class="text-end text-muted fw-medium">{{ "{:,.0f}".format(row[7] or 0) }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -140,8 +175,8 @@ HTML_TEMPLATE = '''
 
     <script>
         document.getElementById('fetchForm').addEventListener('submit', function() {
-            var btn = document.getElementById('submitBtn');
-            var waitMsg = document.getElementById('waitMsg');
+            const btn = document.getElementById('submitBtn');
+            const waitMsg = document.getElementById('waitMsg');
             btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin me-2"></i>Đang xử lý...';
             btn.style.opacity = '0.8';
             btn.style.pointerEvents = 'none';
@@ -152,215 +187,467 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
+
 def get_all_records():
     if not db_pool:
         return []
+
     conn = db_pool.getconn()
-    records = []
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT video_id, platform, title, video_type, view_count, like_count, comment_count FROM video_stats ORDER BY view_count DESC LIMIT 50")
-        records = cursor.fetchall()
-    except Exception as e:
-        print("Lỗi khi đọc Database:", e)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT video_id, platform, title, video_type,
+                       view_count, like_count, comment_count, share_count
+                FROM video_stats
+                ORDER BY view_count DESC, like_count DESC
+                LIMIT 50
+                """
+            )
+            return cursor.fetchall()
+    except Exception as exc:
+        conn.rollback()
+        app.logger.exception("Lỗi khi đọc Database: %s", exc)
+        return []
     finally:
         db_pool.putconn(conn)
-    return records
+
 
 # ==========================================
-# MÁY KHOAN DỮ LIỆU XUYÊN LÕI (Xử lý 100% Reels)
+# CHUẨN HÓA SỐ LIỆU FACEBOOK
 # ==========================================
-def parse_number(val):
+def parse_number(value):
+    """Đổi int/float/string/dict summary thành số nguyên; không biến None thành 0."""
+    if value is None or isinstance(value, bool):
+        return None
+
     try:
-        if isinstance(val, (int, float)): return int(val)
-        if isinstance(val, str):
-            s = val.upper().strip().replace(',', '').replace(' ', '')
-            if s.endswith('K'): return int(float(s[:-1]) * 1000)
-            if s.endswith('M'): return int(float(s[:-1]) * 1000000)
-            if s.endswith('B'): return int(float(s[:-1]) * 1000000000)
-            return int(float(s))
-    except: pass
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        if isinstance(value, dict):
+            summary = value.get("summary")
+            if isinstance(summary, dict):
+                for key in ("total_count", "totalCount", "count", "total"):
+                    parsed = parse_number(summary.get(key))
+                    if parsed is not None:
+                        return parsed
+
+            for key in ("total_count", "totalCount", "count", "total", "value"):
+                parsed = parse_number(value.get(key))
+                if parsed is not None:
+                    return parsed
+            return None
+
+        if isinstance(value, str):
+            text = value.strip().upper().replace("\u00A0", "").replace(" ", "")
+            if not text:
+                return None
+
+            multiplier = 1
+            if text[-1:] in {"K", "M", "B"}:
+                suffix = text[-1]
+                text = text[:-1]
+                multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix]
+                # Dạng 1,2K thường dùng dấu phẩy làm phần thập phân.
+                if "," in text and "." not in text and text.count(",") == 1:
+                    text = text.replace(",", ".")
+                else:
+                    text = text.replace(",", "")
+            else:
+                text = text.replace(",", "")
+
+            text = re.sub(r"[^0-9.+-]", "", text)
+            if not text:
+                return None
+            return int(float(text) * multiplier)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
     return None
 
-def dig_stats(data, stat_type):
-    found = []
-    like_keys = ['like', 'reaction', 'liker', 'favorite']
-    comment_keys = ['comment']
-    view_keys = ['view', 'play']
-    
-    def traverse(obj, parent_key=""):
-        if isinstance(obj, dict):
-            pk = parent_key.lower()
-            # Bóc tách lớp trong nếu key cha khớp từ khóa
-            if pk and 'id' not in pk and 'url' not in pk and 'time' not in pk:
-                is_match = False
-                if stat_type == 'like' and any(x in pk for x in like_keys): is_match = True
-                if stat_type == 'comment' and any(x in pk for x in comment_keys): is_match = True
-                if stat_type == 'view' and any(x in pk for x in view_keys): is_match = True
-                
-                if is_match:
-                    for k in ['count', 'total_count', 'totalcount', 'total']:
-                        if k in obj:
-                            v = parse_number(obj[k])
-                            if v is not None: found.append(v)
-                    if 'summary' in obj and isinstance(obj['summary'], dict):
-                        if 'total_count' in obj['summary']:
-                            v = parse_number(obj['summary']['total_count'])
-                            if v is not None: found.append(v)
 
-            # Quét đệ quy xuống tầng dưới
-            for k, v in obj.items():
-                k_lower = k.lower()
-                if 'id' not in k_lower and 'url' not in k_lower and 'text' not in k_lower and 'time' not in k_lower:
-                    if isinstance(v, (int, float, str)):
-                        v_num = parse_number(v)
-                        if v_num is not None:
-                            if stat_type == 'like' and any(x in k_lower for x in like_keys): found.append(v_num)
-                            if stat_type == 'comment' and any(x in k_lower for x in comment_keys): found.append(v_num)
-                            if stat_type == 'view' and any(x in k_lower for x in view_keys): found.append(v_num)
-                traverse(v, k)
-        elif isinstance(obj, list):
-            for i in obj:
-                traverse(i, parent_key)
-                
-    traverse(data)
-    # Lọc bỏ các mã ID rác và Timestamp (Thường lớn hơn 1 Tỷ)
-    valid = [v for v in found if v < 1000000000] 
-    return max(valid) if valid else 0
+def numeric_candidates(item, keys):
+    """Lấy toàn bộ giá trị hợp lệ ở các key, thay vì dừng ở key đầu tiên có số 0."""
+    values = []
+    for key in keys:
+        if key not in item:
+            continue
+        parsed = parse_number(item.get(key))
+        if parsed is not None:
+            values.append(parsed)
+    return values
+
+
+def max_stat(item, keys):
+    values = numeric_candidates(item, keys)
+    return max(values) if values else 0
+
+
+def extract_facebook_metrics(item):
+    # Các key theo output hiện tại của apify/facebook-posts-scraper được đặt trước.
+    views = max_stat(
+        item,
+        [
+            "viewsCount",
+            "videoPostViewCount",
+            "videoViewCount",
+            "viewCount",
+            "playCount",
+            "views",
+            "play_count",
+        ],
+    )
+
+    likes = max_stat(
+        item,
+        [
+            "likes",                 # Tổng reaction theo schema hiện tại
+            "topReactionsCount",
+            "reactionsCount",
+            "reactionCount",
+            "likesCount",
+            "postLikes",
+            "reaction_count",
+        ],
+    )
+
+    # Nếu tổng reaction không có, cộng từng loại reaction.
+    reaction_sum = sum(
+        max_stat(item, [key])
+        for key in (
+            "reactionLikeCount",
+            "reactionLoveCount",
+            "reactionHahaCount",
+            "reactionWowCount",
+            "reactionSadCount",
+            "reactionAngryCount",
+            "reactionCareCount",
+        )
+    )
+    likes = max(likes, reaction_sum)
+
+    # 'likers' có thể chỉ là danh sách/mẫu hoặc count cũ, không cho nó đè tổng reaction.
+    if likes == 0:
+        likes = max_stat(item, ["likers"])
+
+    comments = max_stat(
+        item,
+        [
+            "comments",              # Schema hiện tại
+            "commentsCount",
+            "commentCount",
+            "postComments",
+            "comment_count",
+        ],
+    )
+    if comments == 0 and not numeric_candidates(
+        item,
+        ["comments", "commentsCount", "commentCount", "postComments", "comment_count"],
+    ):
+        comments = max_stat(item, ["total_comment_count"])
+
+    shares = max_stat(
+        item,
+        [
+            "shares",                # Schema hiện tại
+            "sharesCount",
+            "shareCount",
+            "postShares",
+            "share_count",
+        ],
+    )
+
+    return views, likes, comments, shares
+
+
+def normalize_facebook_url(url):
+    """Chuẩn hóa domain và bỏ các tham số tracking nhưng giữ ID cần thiết."""
+    if "fb.watch" in url.lower():
+        raise ValueError(
+            "Hệ thống chưa xử lý link fb.watch. Hãy mở link và copy URL facebook.com gốc."
+        )
+
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        url = "https://" + url
+
+    parts = urlsplit(url)
+    host = parts.netloc.lower()
+    if host != "facebook.com" and not host.endswith(".facebook.com"):
+        raise ValueError("URL Facebook không hợp lệ.")
+
+    query = parse_qs(parts.query, keep_blank_values=True)
+    keep_query = {}
+    for key in ("story_fbid", "id", "fbid", "v"):
+        if key in query:
+            keep_query[key] = query[key]
+
+    return urlunsplit(
+        (
+            "https",
+            "www.facebook.com",
+            re.sub(r"/{2,}", "/", parts.path),
+            urlencode(keep_query, doseq=True),
+            "",
+        )
+    )
+
+
+def extract_facebook_content_id(url):
+    parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    for key in ("story_fbid", "fbid", "v"):
+        if query.get(key):
+            return str(query[key][0])
+
+    path = parts.path
+    patterns = (
+        r"/reel/(\d+)",
+        r"/reels/(\d+)",
+        r"/videos/(?:[^/]+/)?(\d+)",
+        r"/posts/([^/?#]+)",
+        r"/permalink/([^/?#]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, path, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def stable_fallback_id(url):
+    return "fb_" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+
+
+def get_facebook_title(item, video_id):
+    title_raw = (
+        item.get("text")
+        or item.get("message")
+        or item.get("description")
+        or item.get("title")
+        or item.get("content")
+        or ""
+    )
+    if isinstance(title_raw, dict):
+        title_raw = title_raw.get("text") or title_raw.get("message") or ""
+
+    title_raw = str(title_raw).strip()
+    if not title_raw or title_raw == "None":
+        author = item.get("user") or item.get("author") or item.get("pageName")
+        if isinstance(author, dict):
+            author_name = author.get("name") or author.get("pageName") or ""
+        else:
+            author_name = str(author or "").strip()
+        title_raw = f"Bài viết của {author_name}" if author_name else ""
+
+    if len(title_raw) > 65:
+        return title_raw[:65] + "..."
+    return title_raw or f"Nội dung Facebook ({video_id[:8]})"
+
+
+def upsert_record(video_id, platform, title, video_type, views, likes, comments, shares):
+    if not db_pool:
+        raise RuntimeError("Database chưa được kết nối.")
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO video_stats (
+                    video_id, platform, title, video_type,
+                    view_count, like_count, comment_count, share_count
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (video_id) DO UPDATE SET
+                    platform = EXCLUDED.platform,
+                    title = EXCLUDED.title,
+                    video_type = EXCLUDED.video_type,
+                    view_count = CASE
+                        WHEN EXCLUDED.view_count > 0 THEN EXCLUDED.view_count
+                        ELSE COALESCE(video_stats.view_count, 0)
+                    END,
+                    like_count = CASE
+                        WHEN EXCLUDED.like_count > 0 THEN EXCLUDED.like_count
+                        ELSE COALESCE(video_stats.like_count, 0)
+                    END,
+                    comment_count = CASE
+                        WHEN EXCLUDED.comment_count > 0 THEN EXCLUDED.comment_count
+                        ELSE COALESCE(video_stats.comment_count, 0)
+                    END,
+                    share_count = CASE
+                        WHEN EXCLUDED.share_count > 0 THEN EXCLUDED.share_count
+                        ELSE COALESCE(video_stats.share_count, 0)
+                    END
+                """,
+                (video_id, platform, title, video_type, views, likes, comments, shares),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     message = ""
-    
+
     if request.method == "POST":
-        url = request.form.get("video_url").strip()
+        url = (request.form.get("video_url") or "").strip()
         video_id = None
         title = ""
         video_type = "Video"
         platform = ""
-        views = likes = comments = 0
+        views = likes = comments = shares = 0
         success = False
+        debug_msg = ""  # Phải khởi tạo cho cả nhánh YouTube lẫn Facebook.
 
         try:
             if "youtube.com" in url or "youtu.be" in url:
                 platform = "youtube"
+                if not API_KEY:
+                    raise RuntimeError("YOUTUBE_API_KEY chưa được cấu hình.")
+
                 if "/shorts/" in url:
                     video_type = "Shorts"
-                    match = re.search(r"/shorts/([a-zA-Z0-9_-]+)", url)
+                    match = re.search(r"/shorts/([a-zA-Z0-9_-]{11})", url)
                 else:
-                    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
-                if match: 
-                    video_id = match.group(1)
+                    match = re.search(r"(?:v=|youtu\.be/|/embed/)([0-9A-Za-z_-]{11})", url)
 
-                if video_id:
-                    api_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id={video_id}&key={API_KEY}"
-                    response = requests.get(api_url).json()
-                    if response.get('items'):
-                        item = response['items'][0]
-                        title = item['snippet']['title']
-                        stats = item['statistics']
-                        views = int(stats.get('viewCount', 0))
-                        likes = int(stats.get('likeCount', 0))
-                        comments = int(stats.get('commentCount', 0))
-                        success = True
-                    else:
-                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-circle-xmark me-2"></i>Không tìm thấy video YouTube!</div>'
-                else:
-                    message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
+                if not match:
+                    raise ValueError("Định dạng link YouTube không hợp lệ.")
+
+                video_id = match.group(1)
+                api_url = "https://www.googleapis.com/youtube/v3/videos"
+                response = requests.get(
+                    api_url,
+                    params={
+                        "part": "statistics,snippet",
+                        "id": video_id,
+                        "key": API_KEY,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json()
+
+                if not payload.get("items"):
+                    raise LookupError("Không tìm thấy video YouTube.")
+
+                item = payload["items"][0]
+                title = item["snippet"]["title"]
+                stats = item.get("statistics", {})
+                views = int(stats.get("viewCount", 0))
+                likes = int(stats.get("likeCount", 0))
+                comments = int(stats.get("commentCount", 0))
+                shares = 0  # YouTube Data API không trả share count trong statistics.
+                success = True
 
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
-                safe_url = url
-                if "fb.watch" in safe_url:
-                    raise Exception("Hệ thống không hỗ trợ link fb.watch. Hãy mở trình duyệt và copy link facebook.com gốc.")
-                
-                safe_url = re.sub(r'^(https?://)?([a-zA-Z0-9_.-]+\.)?facebook\.com', 'https://www.facebook.com', safe_url)
+                if not APIFY_TOKEN:
+                    raise RuntimeError("APIFY_TOKEN chưa được cấu hình.")
+
+                safe_url = normalize_facebook_url(url)
+                requested_id = extract_facebook_content_id(safe_url)
 
                 client = ApifyClient(APIFY_TOKEN)
                 run_input = {
                     "startUrls": [{"url": safe_url}],
                     "resultsLimit": 1,
-                    "proxyConfiguration": {"useApifyProxy": True}
+                    "proxyConfiguration": {"useApifyProxy": True},
                 }
-                
+
                 run = client.actor("apify/facebook-posts-scraper").call(run_input=run_input)
-                dataset = client.dataset(run.default_dataset_id)
-                items = dataset.list_items().items
-                
-                if items:
-                    item = items[0]
-                    
-                    url_parts = [p for p in url.split('/') if p]
-                    fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
-                    raw_id = item.get('postId') or item.get('id') or item.get('post_id') or fallback_id
-                    
-                    if isinstance(raw_id, dict):
-                        raw_id = raw_id.get('id') or str(raw_id)
-                    video_id = str(raw_id)[:250]
-                    
-                    title_raw = item.get('text') or item.get('message') or item.get('description') or item.get('title') or item.get('content') or ''
-                    if isinstance(title_raw, dict):
-                        title_raw = title_raw.get('text') or title_raw.get('message') or ''
-                        
-                    title_raw = str(title_raw).strip()
-                    
-                    if not title_raw or title_raw == "None":
-                        author = item.get('user') or item.get('author')
-                        author_name = author.get('name') if isinstance(author, dict) else ''
-                        title_raw = f"Bài viết của {author_name}" if author_name else ""
-                        
-                    title = title_raw[:65] + "..." if len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
-                    
-                    if "reel" in url:
-                        video_type = "Reels"
-                    elif "posts" in url or "pfbid" in url:
-                        video_type = "Bài Viết FB"
-                    elif item.get('is_video') or "watch" in url or "video" in url:
-                        video_type = "Video FB"
-                    else:
-                        video_type = "Post FB"
-                    
-                    # 🚀 GỌI MÁY KHOAN DỮ LIỆU ĐỂ LẤY SỐ
-                    views = dig_stats(item, 'view')
-                    likes = dig_stats(item, 'like')
-                    comments = dig_stats(item, 'comment')
-                    
-                    success = True
-                    
-                    if views == 0 and likes == 0 and comments == 0:
-                        message = f'<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Facebook đang ẩn sạch dữ liệu lượng tương tác của bài viết này. Thử lại bằng 1 link Reel khác nhé!</div>'
+                dataset_id = getattr(run, "default_dataset_id", None)
+                if not dataset_id and hasattr(run, "get"):
+                    dataset_id = run.get("defaultDatasetId") or run.get("default_dataset_id")
+                if not dataset_id:
+                    raise RuntimeError("Apify run không trả defaultDatasetId.")
+
+                items = client.dataset(dataset_id).list_items().items
+                if not items:
+                    raise LookupError("Bot không lấy được dữ liệu. Bài viết có thể không công khai hoặc Actor không hỗ trợ URL này.")
+
+                item = items[0]
+
+                raw_id = item.get("postId") or item.get("id") or item.get("post_id") or requested_id
+                if isinstance(raw_id, dict):
+                    raw_id = raw_id.get("id")
+                video_id = str(raw_id or stable_fallback_id(safe_url))[:250]
+
+                title = get_facebook_title(item, video_id)
+
+                if "/reel/" in safe_url or "/reels/" in safe_url:
+                    video_type = "Reels"
+                elif "/posts/" in safe_url or "story_fbid=" in safe_url:
+                    video_type = "Bài Viết FB"
+                elif item.get("isVideo") or item.get("is_video") or "/videos/" in safe_url or "/watch" in safe_url:
+                    video_type = "Video FB"
                 else:
-                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn!</div>'
+                    video_type = "Post FB"
+
+                views, likes, comments, shares = extract_facebook_metrics(item)
+                success = True
+
+                metric_keys = {
+                    key: item.get(key)
+                    for key in item.keys()
+                    if any(token in key.lower() for token in ("like", "reaction", "comment", "share", "view", "play"))
+                }
+                app.logger.info(
+                    "Facebook metric fields (%s): %s",
+                    safe_url,
+                    json.dumps(metric_keys, ensure_ascii=False, default=str),
+                )
+
+                if views == likes == comments == shares == 0:
+                    debug_msg = (
+                        '<br><small class="text-danger mt-2 d-block">'
+                        '<i class="fa-solid fa-bug me-1"></i>'
+                        '<b>Không thấy số liệu công khai trong dataset.</b> '
+                        'Kiểm tra log "Facebook metric fields" và dataset của lần chạy Apify.'
+                        "</small>"
+                    )
             else:
-                message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Chỉ hỗ trợ Link YouTube và Facebook!</div>'
+                raise ValueError("Chỉ hỗ trợ link YouTube và Facebook.")
 
-            if success and video_id and db_pool:
-                conn = db_pool.getconn()
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO video_stats (video_id, platform, title, video_type, view_count, like_count, comment_count)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT(video_id) DO UPDATE SET
-                            platform=EXCLUDED.platform,
-                            title=EXCLUDED.title,
-                            video_type=EXCLUDED.video_type,
-                            view_count=EXCLUDED.view_count,
-                            like_count=EXCLUDED.like_count,
-                            comment_count=EXCLUDED.comment_count
-                    ''', (video_id, platform, title, video_type, views, likes, comments))
-                    conn.commit()
-                    message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b></div>'
-                except Exception as db_err:
-                    message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-database me-2"></i>Lỗi ghi DB: {str(db_err)}</div>'
-                finally:
-                    db_pool.putconn(conn)
+            if success and video_id:
+                upsert_record(
+                    video_id,
+                    platform,
+                    title,
+                    video_type,
+                    views,
+                    likes,
+                    comments,
+                    shares,
+                )
+                safe_title = escape(title)
+                message = (
+                    '<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success">'
+                    '<i class="fa-solid fa-circle-check me-2"></i>'
+                    f'Đã thu thập và lưu thành công: <b>{safe_title}</b> '
+                    f'— xem {views:,}, thích {likes:,}, bình luận {comments:,}, chia sẻ {shares:,}'
+                    f'{debug_msg}</div>'
+                )
 
-        except Exception as e:
-            message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Lỗi gọi API: {str(e)}</div>'
+        except Exception as exc:
+            app.logger.exception("Lỗi thu thập dữ liệu: %s", exc)
+            safe_error = escape(str(exc))
+            message = (
+                '<div class="alert alert-danger border-0">'
+                '<i class="fa-solid fa-triangle-exclamation me-2"></i>'
+                f'Lỗi: {safe_error}'
+                '</div>'
+            )
 
     saved_records = get_all_records()
     return render_template_string(HTML_TEMPLATE, message=message, records=saved_records)
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
