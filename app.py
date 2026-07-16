@@ -87,7 +87,7 @@ HTML_TEMPLATE = '''
                     <i class="fa-solid fa-cloud-arrow-down me-2"></i>Tiến Hành Thu Thập Dữ Liệu
                 </button>
                 <div id="waitMsg" class="text-center mt-3 text-primary fw-medium" style="display:none; font-size: 0.9rem;">
-                    <i class="fa-solid fa-circle-notch fa-spin me-2"></i>Hệ thống đang quét... (Quá trình cào Facebook có thể mất 15-30 giây)
+                    <i class="fa-solid fa-circle-notch fa-spin me-2"></i>Hệ thống đang quét... (Facebook Reels cần 15-30 giây để khoan lõi)
                 </div>
             </form>
             
@@ -168,48 +168,65 @@ def get_all_records():
     return records
 
 # ==========================================
-# CỖ MÁY NHAI SỐ (Nâng cấp cực mạnh để mổ bụng 'likers' & 'summary')
+# MÁY KHOAN DỮ LIỆU XUYÊN LÕI (Xử lý 100% Reels)
 # ==========================================
 def parse_number(val):
-    if val is None:
-        return None
     try:
-        if isinstance(val, (int, float)):
-            return int(val)
-            
-        if isinstance(val, dict):
-            # Thọc sâu vào lớp 'summary' của Facebook
-            summary = val.get('summary', {})
-            if isinstance(summary, dict) and 'total_count' in summary:
-                val = summary.get('total_count')
-            else:
-                val = val.get('count') or val.get('totalCount') or val.get('total_count') or val.get('total')
-            if val is None:
-                return None
-                
+        if isinstance(val, (int, float)): return int(val)
         if isinstance(val, str):
             s = val.upper().strip().replace(',', '').replace(' ', '')
-            multiplier = 1
-            if s.endswith('K'):
-                multiplier = 1000
-                s = s[:-1]
-            elif s.endswith('M'):
-                multiplier = 1000000
-                s = s[:-1]
-            elif s.endswith('B'):
-                multiplier = 1000000000
-                s = s[:-1]
-            return int(float(s) * multiplier)
-    except:
-        return None
+            if s.endswith('K'): return int(float(s[:-1]) * 1000)
+            if s.endswith('M'): return int(float(s[:-1]) * 1000000)
+            if s.endswith('B'): return int(float(s[:-1]) * 1000000000)
+            return int(float(s))
+    except: pass
     return None
 
-def extract_stat(item, keys):
-    for key in keys:
-        val = parse_number(item.get(key))
-        if val is not None:
-            return val
-    return 0
+def dig_stats(data, stat_type):
+    found = []
+    like_keys = ['like', 'reaction', 'liker', 'favorite']
+    comment_keys = ['comment']
+    view_keys = ['view', 'play']
+    
+    def traverse(obj, parent_key=""):
+        if isinstance(obj, dict):
+            pk = parent_key.lower()
+            # Bóc tách lớp trong nếu key cha khớp từ khóa
+            if pk and 'id' not in pk and 'url' not in pk and 'time' not in pk:
+                is_match = False
+                if stat_type == 'like' and any(x in pk for x in like_keys): is_match = True
+                if stat_type == 'comment' and any(x in pk for x in comment_keys): is_match = True
+                if stat_type == 'view' and any(x in pk for x in view_keys): is_match = True
+                
+                if is_match:
+                    for k in ['count', 'total_count', 'totalcount', 'total']:
+                        if k in obj:
+                            v = parse_number(obj[k])
+                            if v is not None: found.append(v)
+                    if 'summary' in obj and isinstance(obj['summary'], dict):
+                        if 'total_count' in obj['summary']:
+                            v = parse_number(obj['summary']['total_count'])
+                            if v is not None: found.append(v)
+
+            # Quét đệ quy xuống tầng dưới
+            for k, v in obj.items():
+                k_lower = k.lower()
+                if 'id' not in k_lower and 'url' not in k_lower and 'text' not in k_lower and 'time' not in k_lower:
+                    if isinstance(v, (int, float, str)):
+                        v_num = parse_number(v)
+                        if v_num is not None:
+                            if stat_type == 'like' and any(x in k_lower for x in like_keys): found.append(v_num)
+                            if stat_type == 'comment' and any(x in k_lower for x in comment_keys): found.append(v_num)
+                            if stat_type == 'view' and any(x in k_lower for x in view_keys): found.append(v_num)
+                traverse(v, k)
+        elif isinstance(obj, list):
+            for i in obj:
+                traverse(i, parent_key)
+                
+    traverse(data)
+    # Lọc bỏ các mã ID rác và Timestamp (Thường lớn hơn 1 Tỷ)
+    valid = [v for v in found if v < 1000000000] 
+    return max(valid) if valid else 0
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -303,18 +320,15 @@ def index():
                     else:
                         video_type = "Post FB"
                     
-                    # BỔ SUNG CÁC BIẾN MÀ CHẾ ĐỘ SIÊU ÂM TÌM THẤY VÀO TỪ ĐIỂN
-                    views = extract_stat(item, ['videoViewCount', 'viewsCount', 'views', 'playCount', 'viewCount', 'play_count'])
-                    likes = extract_stat(item, ['likers', 'likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes', 'reaction_count'])
-                    comments = extract_stat(item, ['total_comment_count', 'comments', 'commentsCount', 'postComments', 'comment_count'])
+                    # 🚀 GỌI MÁY KHOAN DỮ LIỆU ĐỂ LẤY SỐ
+                    views = dig_stats(item, 'view')
+                    likes = dig_stats(item, 'like')
+                    comments = dig_stats(item, 'comment')
                     
                     success = True
                     
-                    # TÍNH NĂNG DEBUG (Phòng hờ tương lai nó giấu tiếp)
-                    debug_msg = ""
                     if views == 0 and likes == 0 and comments == 0:
-                        sus_keys = [k for k in item.keys() if 'like' in k.lower() or 'view' in k.lower() or 'count' in k.lower() or 'stat' in k.lower() or 'reaction' in k.lower()]
-                        debug_msg = f'<br><small class="text-danger mt-2 d-block"><i class="fa-solid fa-bug me-1"></i><b>Chế độ Siêu Âm:</b> Tiêu đề lấy được nhưng số bị Facebook giấu. Các biến Bot tìm thấy: {", ".join(sus_keys[:10])}</small>'
+                        message = f'<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Facebook đang ẩn sạch dữ liệu lượng tương tác của bài viết này. Thử lại bằng 1 link Reel khác nhé!</div>'
                 else:
                     message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn!</div>'
             else:
@@ -336,7 +350,7 @@ def index():
                             comment_count=EXCLUDED.comment_count
                     ''', (video_id, platform, title, video_type, views, likes, comments))
                     conn.commit()
-                    message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b> {debug_msg}</div>'
+                    message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b></div>'
                 except Exception as db_err:
                     message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-database me-2"></i>Lỗi ghi DB: {str(db_err)}</div>'
                 finally:
