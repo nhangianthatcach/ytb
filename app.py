@@ -37,7 +37,7 @@ except Exception as e:
     print("Lỗi khởi tạo Database Pool:", e)
 
 # ==========================================
-# GIAO DIỆN HTML (UI/UX)
+# GIAO DIỆN HTML
 # ==========================================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -152,9 +152,6 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# ==========================================
-# CÁC HÀM XỬ LÝ DỮ LIỆU
-# ==========================================
 def get_all_records():
     if not db_pool:
         return []
@@ -170,20 +167,46 @@ def get_all_records():
         db_pool.putconn(conn)
     return records
 
-# HÀM MỔ BỤNG DỮ LIỆU SỐ (Chống lỗi 0-0-0)
+# ==========================================
+# CỖ MÁY NHAI SỐ (Xử lý mọi định dạng: 1.5K, 12,000, Dict...)
+# ==========================================
+def parse_number(val):
+    if val is None:
+        return None
+    try:
+        # Nếu đã là số chuẩn
+        if isinstance(val, (int, float)):
+            return int(val)
+        
+        # Nếu bị giấu trong Dictionary
+        if isinstance(val, dict):
+            val = val.get('count') or val.get('totalCount') or val.get('total_count') or val.get('total')
+            if val is None:
+                return None
+            
+        # Nếu là dạng chuỗi có chứa K, M, B hoặc dấu phẩy (vd: 3.5K, 12,000)
+        if isinstance(val, str):
+            s = val.upper().strip().replace(',', '').replace(' ', '')
+            multiplier = 1
+            if s.endswith('K'):
+                multiplier = 1000
+                s = s[:-1]
+            elif s.endswith('M'):
+                multiplier = 1000000
+                s = s[:-1]
+            elif s.endswith('B'):
+                multiplier = 1000000000
+                s = s[:-1]
+            return int(float(s) * multiplier)
+    except:
+        return None
+    return None
+
 def extract_stat(item, keys):
     for key in keys:
-        val = item.get(key)
+        val = parse_number(item.get(key))
         if val is not None:
-            # Nếu Facebook giấu số liệu trong 1 cái hộp (dictionary)
-            if isinstance(val, dict):
-                val = val.get('count') or val.get('totalCount') or val.get('summary', {}).get('total_count') or val.get('total')
-                if val is None:
-                    continue
-            try:
-                return int(val)
-            except:
-                continue
+            return val
     return 0
 
 @app.route("/", methods=["GET", "POST"])
@@ -200,9 +223,6 @@ def index():
         success = False
 
         try:
-            # ==========================================
-            # 1. NHÁNH YOUTUBE 
-            # ==========================================
             if "youtube.com" in url or "youtu.be" in url:
                 platform = "youtube"
                 if "/shorts/" in url:
@@ -229,9 +249,6 @@ def index():
                 else:
                     message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Định dạng link YouTube không hợp lệ!</div>'
 
-            # ==========================================
-            # 2. NHÁNH FACEBOOK (BẢN FINAL CHỐNG LỖI DICT)
-            # ==========================================
             elif "facebook.com" in url or "fb.watch" in url:
                 platform = "facebook"
                 safe_url = url
@@ -254,31 +271,27 @@ def index():
                 if items:
                     item = items[0]
                     
-                    # 1. Bóc ID 
                     url_parts = [p for p in url.split('/') if p]
                     fallback_id = url_parts[-1] if url_parts else 'fb_' + str(abs(hash(url)))
                     raw_id = item.get('postId') or item.get('id') or item.get('post_id') or fallback_id
                     
-                    # Nếu ID bị chui vào dict thì bóc ra
                     if isinstance(raw_id, dict):
                         raw_id = raw_id.get('id') or str(raw_id)
                     video_id = str(raw_id)[:250]
                     
-                    # 2. Bóc Tiêu Đề (ÉP KIỂU STRING ĐỂ CHỐNG DB CRASH)
                     title_raw = item.get('text') or item.get('message') or item.get('description') or item.get('title') or item.get('content') or ''
                     if isinstance(title_raw, dict):
                         title_raw = title_raw.get('text') or title_raw.get('message') or ''
                         
                     title_raw = str(title_raw).strip()
                     
-                    if not title_raw:
+                    if not title_raw or title_raw == "None":
                         author = item.get('user') or item.get('author')
                         author_name = author.get('name') if isinstance(author, dict) else ''
                         title_raw = f"Bài viết của {author_name}" if author_name else ""
                         
                     title = title_raw[:65] + "..." if len(title_raw) > 65 else (title_raw or f"Nội dung Facebook ({video_id[:8]})")
                     
-                    # 3. Gắn nhãn
                     if "reel" in url:
                         video_type = "Reels"
                     elif "posts" in url or "pfbid" in url:
@@ -288,24 +301,24 @@ def index():
                     else:
                         video_type = "Post FB"
                     
-                    # 4. Bóc Số Liệu Bằng Hàm Vét Cạn
-                    views = extract_stat(item, ['videoViewCount', 'viewsCount', 'views', 'playCount'])
-                    likes = extract_stat(item, ['likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes'])
-                    comments = extract_stat(item, ['comments', 'commentsCount', 'postComments'])
+                    # Quét toàn bộ bộ từ điển
+                    views = extract_stat(item, ['videoViewCount', 'viewsCount', 'views', 'playCount', 'viewCount'])
+                    likes = extract_stat(item, ['likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes', 'reaction_count'])
+                    comments = extract_stat(item, ['comments', 'commentsCount', 'postComments', 'comment_count'])
                     
-                    # Cửa tử lọc rác
-                    if views == 0 and likes == 0 and comments == 0 and not title_raw:
-                        message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Facebook đang chặn quyền lấy dữ liệu! Thử lại với link khác.</div>'
-                    else:
-                        success = True
+                    success = True
+                    
+                    # TÍNH NĂNG DEBUG MỚI
+                    debug_msg = ""
+                    if views == 0 and likes == 0 and comments == 0:
+                        # Rút trích các key khả nghi để bắt lỗi
+                        sus_keys = [k for k in item.keys() if 'like' in k.lower() or 'view' in k.lower() or 'count' in k.lower() or 'stat' in k.lower() or 'reaction' in k.lower()]
+                        debug_msg = f'<br><small class="text-danger mt-2 d-block"><i class="fa-solid fa-bug me-1"></i><b>Chế độ Siêu Âm:</b> Tiêu đề lấy được nhưng số bị Facebook giấu. Các biến Bot tìm thấy: {", ".join(sus_keys[:10])}</small>'
                 else:
-                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn hoặc không công khai!</div>'
+                    message = '<div class="alert alert-warning border-0"><i class="fa-solid fa-user-secret me-2"></i>Bot không thu thập được gì. Bài viết có thể bị ẩn!</div>'
             else:
                 message = '<div class="alert alert-danger border-0"><i class="fa-solid fa-triangle-exclamation me-2"></i>Chỉ hỗ trợ Link YouTube và Facebook!</div>'
 
-            # ==========================================
-            # 3. LƯU VÀO DATABASE
-            # ==========================================
             if success and video_id and db_pool:
                 conn = db_pool.getconn()
                 try:
@@ -322,7 +335,8 @@ def index():
                             comment_count=EXCLUDED.comment_count
                     ''', (video_id, platform, title, video_type, views, likes, comments))
                     conn.commit()
-                    message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b></div>'
+                    # Hiển thị thông báo thành công kèm Debug nếu có
+                    message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b> {debug_msg}</div>'
                 except Exception as db_err:
                     message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-database me-2"></i>Lỗi ghi DB: {str(db_err)}</div>'
                 finally:
