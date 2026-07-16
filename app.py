@@ -37,7 +37,7 @@ except Exception as e:
     print("Lỗi khởi tạo Database Pool:", e)
 
 # ==========================================
-# GIAO DIỆN HTML
+# GIAO DIỆN HTML (UI/UX)
 # ==========================================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -168,23 +168,25 @@ def get_all_records():
     return records
 
 # ==========================================
-# CỖ MÁY NHAI SỐ (Xử lý mọi định dạng: 1.5K, 12,000, Dict...)
+# CỖ MÁY NHAI SỐ (Nâng cấp cực mạnh để mổ bụng 'likers' & 'summary')
 # ==========================================
 def parse_number(val):
     if val is None:
         return None
     try:
-        # Nếu đã là số chuẩn
         if isinstance(val, (int, float)):
             return int(val)
-        
-        # Nếu bị giấu trong Dictionary
+            
         if isinstance(val, dict):
-            val = val.get('count') or val.get('totalCount') or val.get('total_count') or val.get('total')
+            # Thọc sâu vào lớp 'summary' của Facebook
+            summary = val.get('summary', {})
+            if isinstance(summary, dict) and 'total_count' in summary:
+                val = summary.get('total_count')
+            else:
+                val = val.get('count') or val.get('totalCount') or val.get('total_count') or val.get('total')
             if val is None:
                 return None
-            
-        # Nếu là dạng chuỗi có chứa K, M, B hoặc dấu phẩy (vd: 3.5K, 12,000)
+                
         if isinstance(val, str):
             s = val.upper().strip().replace(',', '').replace(' ', '')
             multiplier = 1
@@ -301,17 +303,16 @@ def index():
                     else:
                         video_type = "Post FB"
                     
-                    # Quét toàn bộ bộ từ điển
-                    views = extract_stat(item, ['videoViewCount', 'viewsCount', 'views', 'playCount', 'viewCount'])
-                    likes = extract_stat(item, ['likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes', 'reaction_count'])
-                    comments = extract_stat(item, ['comments', 'commentsCount', 'postComments', 'comment_count'])
+                    # BỔ SUNG CÁC BIẾN MÀ CHẾ ĐỘ SIÊU ÂM TÌM THẤY VÀO TỪ ĐIỂN
+                    views = extract_stat(item, ['videoViewCount', 'viewsCount', 'views', 'playCount', 'viewCount', 'play_count'])
+                    likes = extract_stat(item, ['likers', 'likes', 'likesCount', 'reactionsCount', 'reactionCount', 'postLikes', 'reaction_count'])
+                    comments = extract_stat(item, ['total_comment_count', 'comments', 'commentsCount', 'postComments', 'comment_count'])
                     
                     success = True
                     
-                    # TÍNH NĂNG DEBUG MỚI
+                    # TÍNH NĂNG DEBUG (Phòng hờ tương lai nó giấu tiếp)
                     debug_msg = ""
                     if views == 0 and likes == 0 and comments == 0:
-                        # Rút trích các key khả nghi để bắt lỗi
                         sus_keys = [k for k in item.keys() if 'like' in k.lower() or 'view' in k.lower() or 'count' in k.lower() or 'stat' in k.lower() or 'reaction' in k.lower()]
                         debug_msg = f'<br><small class="text-danger mt-2 d-block"><i class="fa-solid fa-bug me-1"></i><b>Chế độ Siêu Âm:</b> Tiêu đề lấy được nhưng số bị Facebook giấu. Các biến Bot tìm thấy: {", ".join(sus_keys[:10])}</small>'
                 else:
@@ -335,7 +336,6 @@ def index():
                             comment_count=EXCLUDED.comment_count
                     ''', (video_id, platform, title, video_type, views, likes, comments))
                     conn.commit()
-                    # Hiển thị thông báo thành công kèm Debug nếu có
                     message = f'<div class="alert alert-success border-0 bg-success bg-opacity-10 text-success"><i class="fa-solid fa-circle-check me-2"></i>Đã thu thập và lưu thành công: <b>{title}</b> {debug_msg}</div>'
                 except Exception as db_err:
                     message = f'<div class="alert alert-danger border-0"><i class="fa-solid fa-database me-2"></i>Lỗi ghi DB: {str(db_err)}</div>'
